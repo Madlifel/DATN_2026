@@ -40,19 +40,19 @@ BlynkTimer timer;
 // =====================================================================
 // --- GIỚI HẠN CẢNH BÁO ---
 // =====================================================================
-const float MAX_TEMP = 28.0;  // °C
-const float Min_TEMP = 22.0;  // °C
-const int   MAX_TDS  = 1000;  // ppm
-const int   Min_TDS  = 800;   // ppm
-const float MAX_LUX  = 10000.0;
-const float MIN_LUX  = 15000.0;
+const float MAX_TEMP = 29.0;
+const float Min_TEMP = 22.0;
+const int   MAX_TDS  = 1000;
+const int   Min_TDS  = 600;
+const float MIN_LUX  = 10000.0;
+const float MAX_LUX  = 20000.0;
 
 // =====================================================================
 // --- BIẾN TRẠNG THÁI ---
 // =====================================================================
 bool  autoMode  = false;
 bool  pumpState = false;
-int   ledPwm    = 0;   // Giá trị PWM LED: 0–255 (thủ công từ Slider Blynk)
+int   ledPwm    = 0;
 
 // Buffer TDS
 int   analogBuffer[SCOUNT];
@@ -63,29 +63,37 @@ float tdsValue          = 0;
 float temperature       = 0;
 float luxValue          = 0;
 
+// Nút nhấn
+unsigned long buttonPressStart = 0;
+bool          buttonHolding    = false;
+
 // Chu kỳ bơm tự động
 bool          pumpRunning        = false;
 unsigned long previousMillisPump = 0;
-const long    intervalOn         = 10000UL;  // 10 giây bơm CHẠY
-const long    intervalOff        = 10000UL;  // 10 giây bơm NGHỈ
+const long    intervalOn         = 10000UL;
+const long    intervalOff        = 20000UL;
 
-// Chống spam thông báo
-unsigned long lastNotifyTime  = 0;
-const long    notifyInterval  = 60000UL; // 1 phút
+// Chống spam thông báo Blynk
+unsigned long lastNotifyTime = 0;
+const long    notifyInterval = 300000UL;
 
+// Cache LCD 
+char prevHang0[17] = "";
+char prevHang1[17] = "";
+// Mode Auto/Manual
 // =====================================================================
-// --- THUẬT TOÁN LỌC TRUNG VỊ (MEDIAN FILTER) ---
+// --- THUẬT TOÁN LỌC TRUNG VỊ ---
 // =====================================================================
 int getMedianNum(int bArray[], int iFilterLen) {
-  int bTab[iFilterLen];
+  int bTab[SCOUNT];
   for (byte i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
 
   int bTemp;
   for (int j = 0; j < iFilterLen - 1; j++) {
     for (int i = 0; i < iFilterLen - j - 1; i++) {
       if (bTab[i] > bTab[i + 1]) {
-        bTemp      = bTab[i];
-        bTab[i]    = bTab[i + 1];
+        bTemp       = bTab[i];
+        bTab[i]     = bTab[i + 1];
         bTab[i + 1] = bTemp;
       }
     }
@@ -109,10 +117,9 @@ float tinhTDS(float voltage, float temp) {
 }
 
 // =====================================================================
-// --- CẬP NHẬT TDS (GỌI LIÊN TỤC TRONG LOOP, KHÔNG CÓ DELAY) ---
+// --- CẬP NHẬT TDS ---
 // =====================================================================
 void capnhatTDS() {
-  // Lấy mẫu mỗi 40ms
   static unsigned long analogSampleTimepoint = 0;
   if (millis() - analogSampleTimepoint > 40UL) {
     analogSampleTimepoint = millis();
@@ -121,7 +128,6 @@ void capnhatTDS() {
     if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
   }
 
-  // Tính toán mỗi 800ms
   static unsigned long printTimepoint = 0;
   if (millis() - printTimepoint > 800UL) {
     printTimepoint = millis();
@@ -138,33 +144,32 @@ void PumpAutoControl() {
   if (!autoMode) return;
 
   unsigned long currentMillis = millis();
+  // Tính toán điều kiện môi trường an toàn
+  bool envOK = (temperature >= Min_TEMP && temperature <= MAX_TEMP
+                && tdsValue >= Min_TDS  && tdsValue <= MAX_TDS);
 
   if (pumpRunning) {
-    if (currentMillis - previousMillisPump >= intervalOn) {
-      pumpRunning          = false;
-      pumpState            = false;
-      previousMillisPump   = currentMillis;
+    // FIX: Nếu môi trường không còn an toàn HOẶC đã hết 10 giây thì dừng bơm ngay
+    if (!envOK || (currentMillis - previousMillisPump >= intervalOn)) {
+      pumpRunning        = false;
+      pumpState          = false;
+      previousMillisPump = currentMillis;
       digitalWrite(Pump, HIGH); // Tắt bơm
-      Serial.println("Chu kỳ: TẮT BƠM");
-      Blynk.virtualWrite(V3, pumpState);
+      
+      if (!envOK) Serial.println("NGẮT KHẨN CẤP: Thông số vượt ngưỡng!");
+      else Serial.println("Chu kỳ: TẮT BƠM (Hết 10s)");
+      if (Blynk.connected()) Blynk.virtualWrite(V3, pumpState);
     }
   } else {
+    // Chờ hết 20 giây nghỉ và môi trường phải OK mới được bật lại
     if (currentMillis - previousMillisPump >= intervalOff) {
-      bool envOK = (temperature >= Min_TEMP && temperature <= MAX_TEMP
-                 && tdsValue    >= Min_TDS  && tdsValue    <= MAX_TDS);
-      if (!envOK) {
-        // Môi trường có vấn đề: không cho bật bơm
-        pumpRunning = false;
-        pumpState   = false;
-        digitalWrite(Pump, HIGH);
-        Serial.println("Lỗi môi trường! Khóa bơm để bảo vệ cây.");
-      } else {
-        pumpRunning          = true;
-        pumpState            = true;
-        previousMillisPump   = currentMillis;
+      if (envOK) {
+        pumpRunning        = true;
+        pumpState          = true;
+        previousMillisPump = currentMillis;
         digitalWrite(Pump, LOW); // Bật bơm
         Serial.println("Chu kỳ: BẬT BƠM");
-        Blynk.virtualWrite(V3, pumpState);
+        if (Blynk.connected()) Blynk.virtualWrite(V3, pumpState);
       }
     }
   }
@@ -172,32 +177,24 @@ void PumpAutoControl() {
 
 // =====================================================================
 // --- ĐIỀU CHỈNH ĐỘ SÁNG LED ---
-// Chế độ TỰ ĐỘNG:
-//   - Lux < MIN_LUX : tăng dần PWM (thiếu sáng -> bật thêm LED)
-//   - Lux > MAX_LUX : giảm dần PWM (dư sáng  -> tắt bớt LED)
-//   - Lux trong [MIN_LUX, MAX_LUX] : giữ nguyên PWM
-// Chế độ THỦ CÔNG: dùng giá trị ledPwm do Slider Blynk (V4) gửi về
 // =====================================================================
 void updateLedBrightness(float currentLux) {
-  static int autoPwm = 0;  // Lưu PWM hiện tại của chế độ auto
-  const  int step    = 20;  // Bước tăng/giảm mỗi lần gọi (tăng nếu muốn phản ứng nhanh hơn)
+  static int autoPwm = 0;
+  const  int step    = 20;
 
   int pwmValue;
 
   if (autoMode) {
     if (currentLux < MIN_LUX) {
-      autoPwm += step;     // Thiếu sáng -> tăng LED
+      autoPwm += step;
     } else if (currentLux > MAX_LUX) {
-      autoPwm -= step;     // Dư sáng    -> giảm LED
+      autoPwm -= step;
     }
-    // Trong khoảng [MIN_LUX, MAX_LUX] -> không làm gì, giữ nguyên
-
     autoPwm  = constrain(autoPwm, 0, 255);
     pwmValue = autoPwm;
-    Blynk.virtualWrite(V4, pwmValue);
+    if (Blynk.connected()) Blynk.virtualWrite(V4, pwmValue);
   } else {
-    // Khi ở thủ công: đồng bộ autoPwm để khi chuyển sang Auto không bị giật
-    autoPwm  = ledPwm;
+    autoPwm  = ledPwm; // Đồng bộ để khi chuyển Auto không bị giật
     pwmValue = ledPwm;
   }
 
@@ -207,61 +204,98 @@ void updateLedBrightness(float currentLux) {
 }
 
 // =====================================================================
-// --- GỬI DỮ LIỆU & CẢNH BÁO LÊN BLYNK (GỌI QUA TIMER 3 GIÂY) ---
+// --- ĐIỀU KHIỂN THIẾT BỊ (TIMER 1.2 GIÂY) ---
+// =====================================================================
+void controlDevices() {
+  PumpAutoControl();
+  updateLedBrightness(luxValue);
+}
+
+// =====================================================================
+// --- GỬI DỮ LIỆU LÊN BLYNK (TIMER 3 GIÂY) ---
 // =====================================================================
 void processAndSendData() {
-
   if (!Blynk.connected()) return;
 
-  // Gửi dữ liệu cảm biến
+  // Gửi dữ liệu liên tục lên Blynk để vẽ biểu đồ
   Blynk.virtualWrite(V0, tdsValue);
   Blynk.virtualWrite(V1, temperature);
   Blynk.virtualWrite(V2, luxValue);
-  // Đồng bộ trạng thái thiết bị
-  Blynk.virtualWrite(V3, pumpState);
-  // V4 (LED PWM) được đồng bộ trực tiếp trong updateLedBrightness()
   Blynk.virtualWrite(V5, autoMode);
 
-  Serial.printf("Data sent | Temp: %.1f°C | TDS: %.0f ppm | Lux: %.0f lx\n",
+  Serial.printf("Data | Temp:%.1f°C TDS:%.0fppm Lux:%.0flx\n",
                 temperature, tdsValue, luxValue);
 
-  // Cảnh báo chống spam
-  if (millis() - lastNotifyTime > notifyInterval) {
-    bool hasWarning = false;
+  unsigned long currentMillis = millis();
+  const unsigned long notifyInterval = 300000UL; // 5 phút khóa spam cho từng loại
+
+  // Khai báo 3 biến mốc thời gian riêng biệt cho 3 cảm biến
+  // Sử dụng từ khóa 'static' để biến không bị xóa sau khi thoát hàm
+  static unsigned long lastTempNotify = 0;
+  static unsigned long lastTdsNotify  = 0;
+  static unsigned long lastLuxNotify  = 0;
+
+  // -----------------------------------------------------------------
+  // 1. KIỂM TRA NHIỆT ĐỘ (Chỉ kiểm tra nếu chưa từng báo hoặc đã hết 5 phút)
+  // -----------------------------------------------------------------
+  if (lastTempNotify == 0 || (currentMillis - lastTempNotify > notifyInterval)) {
+    bool tempWarning = false;
 
     if (temperature > MAX_TEMP) {
-      Blynk.logEvent("canh_bao_nhiet_do", "Cảnh báo: Nhiệt độ quá cao!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_nhiet", "Cảnh báo: Nhiệt độ quá cao!");
+      tempWarning = true;
     } else if (temperature < Min_TEMP) {
-      Blynk.logEvent("canh_bao_nhiet_do", "Cảnh báo: Nhiệt độ quá thấp!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_nhiet", "Cảnh báo: Nhiệt độ quá thấp!");
+      tempWarning = true;
     }
+
+    if (tempWarning) {
+      lastTempNotify = currentMillis; // Chỉ khóa riêng mục Nhiệt độ
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 2. KIỂM TRA TDS (Chạy hoàn toàn độc lập với Nhiệt độ)
+  // -----------------------------------------------------------------
+  if (lastTdsNotify == 0 || (currentMillis - lastTdsNotify > notifyInterval)) {
+    bool tdsWarning = false;
 
     if (tdsValue > MAX_TDS) {
-      Blynk.logEvent("canh_bao_tds", "Cảnh báo: Chỉ số TDS vượt ngưỡng!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_tds", "Cảnh báo: TDS vượt ngưỡng!");
+      tdsWarning = true;
     } else if (tdsValue < Min_TDS) {
-      Blynk.logEvent("canh_bao_tds", "Cảnh báo: Chỉ số TDS quá thấp!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_tds", "Cảnh báo: TDS quá thấp!");
+      tdsWarning = true;
     }
+
+    if (tdsWarning) {
+      lastTdsNotify = currentMillis; // Chỉ khóa riêng mục TDS
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 3. KIỂM TRA ÁNH SÁNG (LUX)
+  // -----------------------------------------------------------------
+  if (lastLuxNotify == 0 || (currentMillis - lastLuxNotify > notifyInterval)) {
+    bool luxWarning = false;
 
     if (luxValue > MAX_LUX) {
-      Blynk.logEvent("canh_bao_lux", "Cảnh báo: Chỉ số ánh sáng vượt ngưỡng!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_lux", "Cảnh báo: Ánh sáng vượt ngưỡng!");
+      luxWarning = true;
     } else if (luxValue < MIN_LUX) {
-      Blynk.logEvent("canh_bao_lux", "Cảnh báo: Chỉ số ánh sáng quá thấp!");
-      hasWarning = true;
+      Blynk.logEvent("canh_bao_lux", "Cảnh báo: Ánh sáng quá thấp!");
+      luxWarning = true;
     }
 
-    if (hasWarning) lastNotifyTime = millis();
+    if (luxWarning) {
+      lastLuxNotify = currentMillis; // Chỉ khóa riêng mục Ánh sáng
+    }
   }
 }
 
 // =====================================================================
 // --- NHẬN LỆNH TỪ BLYNK ---
 // =====================================================================
-
-// V3: Điều khiển Bơm (chỉ có tác dụng khi ở chế độ thủ công)
 BLYNK_WRITE(V3) {
   pumpState = param.asInt();
   if (!autoMode) {
@@ -270,7 +304,6 @@ BLYNK_WRITE(V3) {
   }
 }
 
-// V4: Slider điều khiển độ sáng LED (0–255), chỉ có tác dụng ở chế độ thủ công
 BLYNK_WRITE(V4) {
   ledPwm = constrain(param.asInt(), 0, 255);
   if (!autoMode) {
@@ -279,100 +312,86 @@ BLYNK_WRITE(V4) {
   }
 }
 
-// V5: Chuyển chế độ Tự động / Thủ công
 BLYNK_WRITE(V5) {
   autoMode = param.asInt();
   Serial.println(autoMode ? "Chế độ: TỰ ĐỘNG" : "Chế độ: THỦ CÔNG");
-
   if (!autoMode) {
-    // Vừa chuyển sang THỦ CÔNG: áp ngay trạng thái hiện tại
     digitalWrite(Pump,   pumpState ? LOW : HIGH);
     analogWrite(LED_PIN, ledPwm);
   }
-  // Nếu chuyển sang TỰ ĐỘNG: để PumpAutoControl() và updateLedBrightness()
-  // xử lý ở chu kỳ kế tiếp
 }
-BLYNK_CONNECTED() {
-  Serial.println("Đã kết nối Blynk! Đang đồng bộ trạng thái từ App...");
-  
-  // Yêu cầu server tải lại trạng thái cuối cùng của Bơm (V3), LED (V4) và Chế độ (V5)
-  Blynk.syncVirtual(V3, V4, V5); 
-}
-// =====================================================================
-// Lưu nội dung đang hiển thị để so sánh
-static char prevHang0[17] = "";
-static char prevHang1[17] = "";
-void displayLCD() {
-  char bufferHang0[17];
-  char bufferHang1[17];
 
+BLYNK_CONNECTED() {
+  Serial.println("Đã kết nối Blynk! Đồng bộ trạng thái...");
+  Blynk.syncVirtual(V3, V4, V5);
+}
+
+// =====================================================================
+// --- HIỂN THỊ LCD ---
+// =====================================================================
+void displayLCD() {
+  char h0[17], h1[17];
   bool showWarning = (millis() / 2000) % 2 == 0;
 
-  // --- HÀNG 0: Nhiệt độ & Ánh sáng ---
-  // Lưu ý: Thêm các khoảng trắng ở cuối để đảm bảo chuỗi luôn đủ 16 ký tự, ghi đè hoàn toàn ký tự rác cũ
-  if (temperature != DEVICE_DISCONNECTED_C) {
-    if ((temperature > MAX_TEMP || temperature < Min_TEMP) && showWarning) {
-      snprintf(bufferHang0, sizeof(bufferHang0),
-               temperature > MAX_TEMP ? "NhietDo qua CAO!" : "NhietDo qua THAP");
-    } else {
-      snprintf(bufferHang0, sizeof(bufferHang0),
-               "T:%-2d\xDF" "C L:%-6d ", (int)temperature, (int)luxValue); 
-    }
+  // Hàng 0: Nhiệt độ & Lux
+  if (temperature == DEVICE_DISCONNECTED_C) {
+    snprintf(h0, sizeof(h0), "Loi cam bien T! ");
+  } else if ((temperature > MAX_TEMP || temperature < Min_TEMP) && showWarning) {
+    snprintf(h0, sizeof(h0), temperature > MAX_TEMP ? "NhietDo qua CAO!" : "NhietDo qua THAP");
   } else {
-    snprintf(bufferHang0, sizeof(bufferHang0), "Loi cam bien T! ");
+    snprintf(h0, sizeof(h0), "T:%-2d\xDF" "C L:%-5dlx ", (int)temperature, (int)luxValue);
   }
 
-  // --- HÀNG 1: TDS ---
+  // Hàng 1: TDS
   if ((tdsValue > MAX_TDS || tdsValue < Min_TDS) && showWarning) {
-    snprintf(bufferHang1, sizeof(bufferHang1),
-             tdsValue > MAX_TDS ? "TDS qua CAO!    " : "TDS qua THAP!   ");
+    snprintf(h1, sizeof(h1), tdsValue > MAX_TDS ? "TDS qua CAO!    " : "TDS qua THAP!   ");
   } else {
-    snprintf(bufferHang1, sizeof(bufferHang1), "TDS:%-4d ppm    ", (int)tdsValue);
+    snprintf(h1, sizeof(h1), "TDS:%-4d ppm    ", (int)tdsValue);
   }
 
-  // Kỹ thuật 1: Chỉ ghi khi nội dung thay đổi
-  if (strcmp(bufferHang0, prevHang0) != 0) {
+  // Chỉ ghi khi thay đổi
+  if (strcmp(h0, prevHang0) != 0) {
     lcd.setCursor(0, 0);
-    lcd.print(bufferHang0);
-    strncpy(prevHang0, bufferHang0, sizeof(prevHang0));
+    lcd.print(h0);
+    strncpy(prevHang0, h0, sizeof(prevHang0));
   }
-
-  if (strcmp(bufferHang1, prevHang1) != 0) {
+  if (strcmp(h1, prevHang1) != 0) {
     lcd.setCursor(0, 1);
-    lcd.print(bufferHang1);
-    strncpy(prevHang1, bufferHang1, sizeof(prevHang1));
+    lcd.print(h1);
+    strncpy(prevHang1, h1, sizeof(prevHang1));
   }
 }
-// Thêm hàm này lên trên phần setup()
+
+// =====================================================================
+// --- ĐỌC CẢM BIẾN & LCD (TIMER 1 GIÂY) ---
+// =====================================================================
 void docCamBienVaLCD() {
-  // Đọc nhiệt độ và ánh sáng 1 giây/lần
-  luxValue = lightMeter.readLightLevel()*2.2; // Hiệu chỉnh hệ số để khớp thực tế
-  sensors.requestTemperatures();
+  /// 1. Đọc nhiệt độ (kết quả đã được yêu cầu từ 1 giây trước)
   temperature = sensors.getTempCByIndex(0);
 
-  // Gọi hàm hiển thị LCD
+  // 2. Yêu cầu cảm biến bắt đầu lấy mẫu mới cho 1 giây tiếp theo
+  sensors.requestTemperatures(); 
+
+  // 3. Đọc ánh sáng & Hiển thị
+  luxValue = lightMeter.readLightLevel() * 2.2;
   displayLCD();
 }
-void controlDevices(){
-  // Điều khiển bơm và LED dựa trên giá trị cảm biến
-  PumpAutoControl();
-  updateLedBrightness(luxValue);
-}
+
 // =====================================================================
 // --- SETUP ---
 // =====================================================================
 void setup() {
   Serial.begin(115200);
 
-  // FIX: khai báo pinMode TRƯỚC rồi mới dùng digitalWrite
-  pinMode(LED_PIN,     OUTPUT);
-  pinMode(Pump,        OUTPUT);
-  pinMode(LED_status,  OUTPUT);
-  pinMode(Button,      INPUT_PULLUP);
+  pinMode(LED_PIN,      OUTPUT);
+  pinMode(Pump,         OUTPUT);
+  pinMode(LED_status,   OUTPUT);
+  pinMode(Button,       INPUT_PULLUP);
   pinMode(TdsSensorPin, INPUT);
 
-  digitalWrite(LED_PIN,    LOW);   // Tắt LED khi khởi động
-  digitalWrite(Pump,       HIGH);  // Tắt bơm khi khởi động (relay kích thấp)
+
+  digitalWrite(LED_PIN,    LOW);
+  digitalWrite(Pump,       HIGH);
   digitalWrite(LED_status, LOW);
 
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -380,113 +399,102 @@ void setup() {
   lcd.backlight();
 
   sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures(); // Request đầu tiên
 
-  // --- Kết nối WiFi qua WiFiManager ---
-  // Timeout 60 giây: nếu không ai vào cấu hình thì chuyển Offline
+  // --- Kết nối WiFi ---
   wm.setConfigPortalTimeout(60);
-  lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Connecting WiFi.");
-  lcd.setCursor(0, 1); lcd.print("Portal: 60s...");
-
-  Serial.println("Đang cố gắng kết nối WiFi...");
-
-  // Callback: cập nhật đếm ngược lên LCD trong lúc chờ portal
   wm.setAPCallback([](WiFiManager* wm) {
-    Serial.println("Portal đang mở: ThuyCanh_Setup");
     lcd.clear();
-    lcd.setCursor(0, 0); lcd.print("WiFi: ThuyCanh");
-    lcd.setCursor(0, 1); lcd.print("Pass: 12345678");
+    lcd.setCursor(0, 0); lcd.print("WiFi:ThuyCanh");
+    lcd.setCursor(0, 1); lcd.print("Pass:12345678");
   });
 
-  bool res = wm.autoConnect("ThuyCanh_Setup", "12345678");
+  bool res = wm.autoConnect("ThuyCanh", "12345678");
 
   if (!res) {
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print("Offline Mode!");
     lcd.setCursor(0, 1); lcd.print("No WiFi Connect.");
-    Serial.println("Không có WiFi! Chuyển sang CHẾ ĐỘ OFFLINE.");
+    Serial.println("Không có WiFi! Chuyển OFFLINE.");
     autoMode = true;
     for (int i = 0; i < 5; i++) {
-      digitalWrite(LED_status, HIGH); delay(500);
-      digitalWrite(LED_status, LOW);  delay(500);
+      digitalWrite(LED_status, HIGH); delay(300);
+      digitalWrite(LED_status, LOW);  delay(300);
     }
   } else {
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print("WiFi Connected!");
-    Serial.println("Đã kết nối WiFi! Đang chạy CHẾ ĐỘ ONLINE.");
+    Serial.println("Đã kết nối WiFi! CHẾ ĐỘ ONLINE.");
     digitalWrite(LED_status, HIGH);
+    delay(1000);
   }
 
   // --- Khởi tạo BH1750 ---
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-    Serial.println("Khởi tạo BH1750 thành công!");
+    Serial.println("BH1750 OK!");
   } else {
-    Serial.println("Lỗi: Không tìm thấy BH1750. Kiểm tra dây nối.");
+    Serial.println("Lỗi BH1750!");
   }
 
-  // --- Cấu hình Blynk ---
+  // --- Cấu hình Blynk & Timer ---
   Blynk.config(BLYNK_AUTH_TOKEN);
 
-  // Timer gửi dữ liệu mỗi 3 giây
-  timer.setInterval(3000L, processAndSendData);
-  timer.setInterval(1000L, controlDevices); // Điều khiển thiết bị mỗi 1 giây
-  // THÊM: Timer đọc cảm biến và hiển thị LCD mỗi 1 giây
-  timer.setInterval(1000L, docCamBienVaLCD);
+  timer.setInterval(1000L,  docCamBienVaLCD);   // Đọc cảm biến & LCD
+  timer.setInterval(1200L,  controlDevices);     // Điều khiển bơm & LED
+  timer.setInterval(3000L,  processAndSendData); // Gửi Blynk
 }
 
 // =====================================================================
 // --- LOOP ---
 // =====================================================================
 void loop() {
-  // --- Nút nhấn: reset WiFi ---
-  // Nhấn giữ 3 giây để tránh reset nhầm
+  // --- Xử lý nút nhấn (giữ 3 giây để reset WiFi) ---
   if (digitalRead(Button) == LOW) {
-    lcd.setCursor(0, 0); 
-    lcd.print("Resetting WiFi...");
-    Serial.println("Xóa cấu hình WiFi và khởi động lại...");
-    delay(200); // Chống rung nút
-    wm.resetSettings();
-    delay(500);
-    ESP.restart();
+    if (!buttonHolding) {
+      buttonHolding    = true;
+      buttonPressStart = millis();
+    } else if (millis() - buttonPressStart >= 3000) {
+      buttonHolding = false;
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("Configuring WiFi"); 
+      Serial.println("Reset WiFi!");
+      wm.resetSettings();
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    buttonHolding = false; // Nhả tay -> reset bộ đếm
   }
-
-  // --- Xử lý Blynk ---
+  // --- Xử lý WiFi & Blynk ---
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_status, HIGH);
-    // FIX: khôi phục autoMode khi WiFi kết nối lại
-    if (autoMode) {
-      // Chỉ tắt autoMode tự động nếu ban đầu là do mất WiFi (không phải do người dùng chọn)
-      // Giữ nguyên: để người dùng tự quyết trên app Blynk
-    }
+
+    // Kết nối lại Blynk nếu bị mất
     if (!Blynk.connected()) {
-      Blynk.connect(3000);
+      Blynk.connect(500); // Thử nhanh, không block lâu
     }
     if (Blynk.connected()) {
       Blynk.run();
     }
   } else {
-    // Mất WiFi: bật chế độ tự động để bảo vệ cây
+    // Mất WiFi: chuyển offline
+    digitalWrite(LED_status, LOW);
     if (!autoMode) {
       autoMode = true;
-      Serial.println("Mất kết nối WiFi! Chuyển sang CHẾ ĐỘ OFFLINE.");
+      Serial.println("Mất WiFi! Chuyển OFFLINE.");
       lcd.clear();
       lcd.setCursor(0, 0); lcd.print("WiFi Lost!");
       lcd.setCursor(0, 1); lcd.print("Auto Mode ON");
-      digitalWrite(LED_status, LOW);
+      memset(prevHang0, 0, sizeof(prevHang0));
+      memset(prevHang1, 0, sizeof(prevHang1));
       delay(2000);
-      lcd.clear();
     }
   }
-
-
-  // --- Cập nhật TDS (không dùng delay để giữ tần số lấy mẫu) ---
+  // --- Cập nhật TDS ---
   capnhatTDS();
-
-
-  // --- Chạy timer Blynk ---
+  // --- Timer ---
   timer.run();
-
-  // FIX: Bỏ delay(500) để capnhatTDS() hoạt động đúng tần số 40ms
-  // Nếu cần giảm tải CPU có thể dùng delay nhỏ hơn như delay(10)
   delay(10);
 }
