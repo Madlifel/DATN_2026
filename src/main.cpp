@@ -11,7 +11,10 @@
 #include <WiFiManager.h>
 #include <LiquidCrystal_I2C.h>
 #include <BlynkSimpleEsp32.h>
+#include <time.h>
 
+#define NTP_SERVER  "pool.ntp.org"
+#define UTC_OFFSET  (7 * 3600)   // GMT+7 cho Việt Nam
 // =====================================================================
 // --- CẤU HÌNH CHÂN (PIN DEFINITIONS) ---
 // =====================================================================
@@ -25,6 +28,8 @@
 #define Pump          26
 #define I2C_SDA       21
 #define I2C_SCL       22
+#define LIGHT_ON_HOUR   8    // Bật lúc 08:00
+#define LIGHT_OFF_HOUR  16   // Tắt lúc 16:00 (4 giờ chiều)
 
 // =====================================================================
 // --- KHỞI TẠO ĐỐI TƯỢNG ---
@@ -62,7 +67,7 @@ float averageVoltage    = 0;
 float tdsValue          = 0;
 float temperature       = 0;
 float luxValue          = 0;
-
+float bu                = 0.02;
 // Nút nhấn
 unsigned long buttonPressStart = 0;
 bool          buttonHolding    = false;
@@ -108,7 +113,11 @@ int getMedianNum(int bArray[], int iFilterLen) {
 // --- TÍNH GIÁ TRỊ TDS ---
 // =====================================================================
 float tinhTDS(float voltage, float temp) {
-  float compensationCoefficient = 1.0 + 0.02 * (temp - 25.0);
+  // Nếu cảm biến lỗi, giả định nước ở 25°C để giữ cho phép tính TDS ổn định
+  if (temp == DEVICE_DISCONNECTED_C || temp <= 0) {
+      temp = 25.0; 
+  }
+  float compensationCoefficient = 1.0 + bu * (temp - 25.0);
   float compensationVoltage     = voltage / compensationCoefficient;
   float tds = (133.42 * pow(compensationVoltage, 3)
              - 255.86 * pow(compensationVoltage, 2)
@@ -174,7 +183,35 @@ void PumpAutoControl() {
     }
   }
 }
+// ==================== HÀM ĐỒNG BỘ HỜI GIAN ====================
+void setupTime() {
+  configTime(UTC_OFFSET, 0, NTP_SERVER);
+  Serial.print("Đồng bộ NTP");
 
+  unsigned long start = millis();
+  while (time(nullptr) < 1577836800UL) {
+    if (millis() - start >= 10000UL) {   // Timeout 10 giây
+      Serial.println(" THẤT BẠI (sẽ thử lại sau)");
+      return;
+    }
+    Serial.print(".");
+    // Xử lý WiFi/yield trong lúc chờ, không block hệ thống
+    yield();
+    delay(200);  // ← vẫn cần delay nhỏ để NTP có thời gian phản hồi
+  }
+  Serial.println(" OK");
+}
+// ==================== HÀM KIỂM TRA KHUNG GIỜ ====================
+bool isWithinSchedule() {
+  time_t now = time(nullptr);
+   // NTP chưa đồng bộ (time < năm 2020) → cho phép sáng mặc định
+  if (now < 1577836800UL) {
+    return true;
+  }
+  struct tm* t = localtime(&now);
+  int hour = t->tm_hour;
+  return (hour >= LIGHT_ON_HOUR && hour < LIGHT_OFF_HOUR);
+}
 // =====================================================================
 // --- ĐIỀU CHỈNH ĐỘ SÁNG LED ---
 // =====================================================================
@@ -183,7 +220,15 @@ void updateLedBrightness(float currentLux) {
   const  int step    = 20;
 
   int pwmValue;
-
+  // ── 1. Kiểm tra khung giờ ──────────────────────────
+  if (autoMode && !isWithinSchedule()) {
+    analogWrite(LED_PIN, 0);
+    autoPwm = 0;
+    if (Blynk.connected()) Blynk.virtualWrite(V4, 0);
+    Serial.println("LED OFF: Ngoài khung giờ (Auto)");
+    return;
+  }
+  // ── 2. Logic điều chỉnh độ sáng theo ánh sáng ──────
   if (autoMode) {
     if (currentLux < MIN_LUX) {
       autoPwm += step;
@@ -196,6 +241,7 @@ void updateLedBrightness(float currentLux) {
   } else {
     autoPwm  = ledPwm; // Đồng bộ để khi chuyển Auto không bị giật
     pwmValue = ledPwm;
+    if (Blynk.connected()) Blynk.virtualWrite(V4, pwmValue);
   }
 
   analogWrite(LED_PIN, pwmValue);
@@ -216,7 +262,15 @@ void controlDevices() {
 // =====================================================================
 void processAndSendData() {
   if (!Blynk.connected()) return;
-
+   // Tự đồng bộ NTP nếu chưa có thời gian hợp lệ
+  static bool ntpSynced = false;
+  if (!ntpSynced && time(nullptr) > 1577836800UL) {
+    ntpSynced = true;
+    Serial.println("NTP đã đồng bộ thành công!");
+  }
+  if (!ntpSynced) {
+    configTime(UTC_OFFSET, 0, NTP_SERVER); // Thử lại
+  }
   // Gửi dữ liệu liên tục lên Blynk để vẽ biểu đồ
   Blynk.virtualWrite(V0, tdsValue);
   Blynk.virtualWrite(V1, temperature);
@@ -279,6 +333,7 @@ void processAndSendData() {
   if (lastLuxNotify == 0 || (currentMillis - lastLuxNotify > notifyInterval)) {
     bool luxWarning = false;
 
+   if (isWithinSchedule()) {  // ← CHỈ cảnh báo lux khi đang trong khung giờ
     if (luxValue > MAX_LUX) {
       Blynk.logEvent("canh_bao_lux", "Cảnh báo: Ánh sáng vượt ngưỡng!");
       luxWarning = true;
@@ -286,6 +341,7 @@ void processAndSendData() {
       Blynk.logEvent("canh_bao_lux", "Cảnh báo: Ánh sáng quá thấp!");
       luxWarning = true;
     }
+  }
 
     if (luxWarning) {
       lastLuxNotify = currentMillis; // Chỉ khóa riêng mục Ánh sáng
@@ -339,7 +395,7 @@ void displayLCD() {
   } else if ((temperature > MAX_TEMP || temperature < Min_TEMP) && showWarning) {
     snprintf(h0, sizeof(h0), temperature > MAX_TEMP ? "NhietDo qua CAO!" : "NhietDo qua THAP");
   } else {
-    snprintf(h0, sizeof(h0), "T:%-2d\xDF" "C L:%-5dlx ", (int)temperature, (int)luxValue);
+    snprintf(h0, sizeof(h0), "T:%-2d\xDF" "C L:%-5dLx ", (int)temperature, (int)luxValue);
   }
 
   // Hàng 1: TDS
@@ -428,7 +484,7 @@ void setup() {
     lcd.setCursor(0, 0); lcd.print("WiFi Connected!");
     Serial.println("Đã kết nối WiFi! CHẾ ĐỘ ONLINE.");
     digitalWrite(LED_status, HIGH);
-    delay(1000);
+    setupTime();
   }
 
   // --- Khởi tạo BH1750 ---
